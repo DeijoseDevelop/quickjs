@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "quickjs.h"
+#include "quickjs-libc.h"
 #include "cutils.h"
 
 static JSRuntime *new_runtime(void)
@@ -175,9 +176,7 @@ static void cfunctions(void)
 static int timeout_interrupt_handler(JSRuntime *rt, void *opaque)
 {
     int *time = (int *)opaque;
-    if (*time <= MAX_TIME)
-        *time += 1;
-    return *time > MAX_TIME;
+    return (*time)++ > MAX_TIME;
 }
 
 static void sync_call(void)
@@ -234,6 +233,38 @@ static void async_call(void)
     JSValue e = JS_GetException(ctx);
     assert(JS_IsUncatchableError(e));
     JS_FreeValue(ctx, e);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+static void std_eval_interrupt_handler(void)
+{
+    static const char code[] =
+        "import * as std from 'std'; std.evalScript('for(;;){}')";
+    JSRuntime *rt = new_runtime();
+    js_std_init_handlers(rt);
+    JSContext *ctx = JS_NewContext(rt);
+    js_init_module_std(ctx, "std");
+    int time = 0;
+    JS_SetInterruptHandler(rt, timeout_interrupt_handler, &time);
+    JSValue ret =
+        JS_Eval(ctx, code, strlen(code), "<input>", JS_EVAL_TYPE_MODULE);
+    ret = js_std_await(ctx, ret);
+    assert(time > MAX_TIME);
+    assert(JS_IsException(ret));
+    ret = JS_GetException(ctx);
+    assert(JS_IsError(ret));
+    // uncatchable "interrupted" exception is turned into a regular exception
+    assert(!JS_IsUncatchableError(ret));
+    const char *str = JS_ToCString(ctx, ret);
+    assert(str != NULL);
+    assert(strstr(str, "InternalError: interrupted"));
+    JS_FreeCString(ctx, str);
+    JS_FreeValue(ctx, ret);
+    uintptr_t interrupt_handler = js_std_cmd(/*GetInterruptHandler*/5, rt);
+    uintptr_t interrupt_opaque = js_std_cmd(/*GetInterruptOpaque*/6, rt);
+    assert(interrupt_handler == (uintptr_t)timeout_interrupt_handler);
+    assert(interrupt_opaque == (uintptr_t)&time);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 }
@@ -649,6 +680,19 @@ static void utf16_string(void)
         assert(strstr(s, "invalid string length") != NULL);
         JS_FreeCString(ctx, s);
         JS_FreeValue(ctx, e);
+    }
+    {
+        // create wide char slice string, see JS_STRING_SLICE_LEN_MAX
+        JSValue v = eval(ctx, "`\\uD800\\uDC00`.repeat(8192).slice(0, -1)");
+        assert(!JS_IsException(v));
+        size_t n;
+        const uint16_t *u = JS_ToCStringLenUTF16(ctx, &n, v);
+        assert(u);
+        assert(n == 2*8192-1);
+        assert(u[0] == 0xD800);
+        assert(u[1] == 0xDC00);
+        JS_FreeCStringUTF16(ctx, u);
+        JS_FreeValue(ctx, v);
     }
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
@@ -2052,6 +2096,28 @@ void add_intrinsic_bigint(void)
     JS_FreeRuntime(rt);
 }
 
+void new_typed_array(void)
+{
+    JSValueConst argv[4];
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    uint8_t *buf = js_malloc(ctx, 8);
+    JSValue ab = JS_NewArrayBuffer(ctx, buf, 8, /*max_len*/0, NULL, NULL, false);
+    assert(JS_IsArrayBuffer(ab));
+    for (int argc = 0; argc < (int)countof(argv); argc++) {
+        JSValue ret = JS_NewTypedArray(ctx, argc, argv, JS_TYPED_ARRAY_UINT8);
+        assert(!JS_IsException(ret));
+        assert(JS_IsObject(ret));
+        JS_FreeValue(ctx, ret);
+        argv[argc] = JS_UNDEFINED;
+        argv[0] = ab;
+    }
+    JS_FreeValue(ctx, ab);
+    js_free(ctx, buf);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     cfunctions();
@@ -2089,5 +2155,7 @@ int main(void)
     get_class_name();
     object_from();
     add_intrinsic_bigint();
+    new_typed_array();
+    std_eval_interrupt_handler();
     return 0;
 }
